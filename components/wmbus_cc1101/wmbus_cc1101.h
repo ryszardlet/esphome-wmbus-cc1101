@@ -40,7 +40,8 @@ class WMBusSensor : public Component {
 
   // Called by the hub when a fully-decoded telegram arrives whose A-field
   // matches our meter_id. `payload` starts right after the CI byte.
-  void on_telegram(const uint8_t *payload, size_t payload_len, int8_t rssi_dbm);
+  void on_telegram(uint8_t ci, const uint8_t *payload, size_t payload_len,
+                   int8_t rssi_dbm);
 
  protected:
   uint32_t meter_id_{0};

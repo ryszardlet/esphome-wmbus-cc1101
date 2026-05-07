@@ -287,6 +287,7 @@ void WMBusComponent::dispatch_decoded_(const std::vector<uint8_t> &frame,
 
   ESP_LOGD(TAG, "RX L=%u C=0x%02X M=0x%04X A=0x%08X V=0x%02X T=0x%02X CI=0x%02X RSSI=%d",
            (unsigned)l, c, m, a, ver, type, ci, rssi_dbm);
+  ESP_LOGD(TAG, "    frame: %s", format_hex_pretty(frame).c_str());
 
   WMBusSensor *match = nullptr;
   for (auto *s : meters_) {
@@ -305,24 +306,28 @@ void WMBusComponent::dispatch_decoded_(const std::vector<uint8_t> &frame,
 
   const uint8_t *payload = frame.data() + 11;
   size_t payload_len = frame.size() - 11;
-  match->on_telegram(payload, payload_len, rssi_dbm);
+  match->on_telegram(ci, payload, payload_len, rssi_dbm);
 }
 
-void WMBusSensor::on_telegram(const uint8_t *payload, size_t payload_len,
-                              int8_t rssi_dbm) {
+void WMBusSensor::on_telegram(uint8_t ci, const uint8_t *payload,
+                              size_t payload_len, int8_t rssi_dbm) {
   if (rssi_)
     rssi_->publish_state((float)rssi_dbm);
 
   switch (meter_type_) {
     case MeterType::APATOR162: {
-      Apator162Result r = decode_apator162(payload, payload_len);
+      Apator162Result r = decode_apator162(payload, payload_len, ci);
       if (r.ok && total_water_) {
         ESP_LOGI(TAG, "meter 0x%08X: total = %.3f m3 (RSSI %d dBm)",
                  (unsigned) meter_id_, r.total_m3, rssi_dbm);
         total_water_->publish_state((float)r.total_m3);
       } else if (!r.ok) {
-        ESP_LOGW(TAG, "apator162: failed to decode payload (len=%u)",
-                 (unsigned)payload_len);
+        // Dump the raw payload so the failure can be diagnosed offline
+        // (e.g. fed to https://wmbusmeters.org/analyze/).
+        std::vector<uint8_t> hex(payload, payload + payload_len);
+        ESP_LOGW(TAG,
+                 "apator162: failed to decode (CI=0x%02X, len=%u). Payload: %s",
+                 ci, (unsigned) payload_len, format_hex_pretty(hex).c_str());
       }
       break;
     }

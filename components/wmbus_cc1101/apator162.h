@@ -77,37 +77,64 @@ inline int apator162_register_size(uint8_t c) {
 }
 
 // `payload` points at the byte right after CI. `len` is bytes available
-// (already CRC-stripped).
-inline Apator162Result decode_apator162(const uint8_t *payload, size_t len) {
+// (already CRC-stripped). `ci` is the CI byte itself, used to size the
+// transport-layer header that prefixes the manufacturer-specific data.
+//
+// Frame layout for the typical Apator 162 case (CI = 0x7A, short header):
+//
+//   payload[0..3]    short transport header  (ACC, STS, SIG_LO, SIG_HI)
+//   payload[4..]     manufacturer-specific stream:
+//                      [optional 0x2F filler bytes]
+//                      0x0F                       — mfct marker
+//                      date (4 bytes)
+//                      faults (3 bytes)
+//                      <register-id><data...>     — repeating
+//                      0xFF...                    — pad to encryption block
+//
+// Total bytes consumed from 0x0F (inclusive) up to first register = 8,
+// matching wmbusmeters' driver_apator162 (`size_t i=8;`).
+inline Apator162Result decode_apator162(const uint8_t *payload, size_t len,
+                                        uint8_t ci = 0x7A) {
   Apator162Result r;
-  if (payload == nullptr || len < 12)
+  if (payload == nullptr)
     return r;
 
-  // Skip optional 2F2F filler then locate the manufacturer 0x0F marker.
+  // Strip the CI-specific transport header.
   size_t i = 0;
+  if (ci == 0x7A) {
+    if (len < 4)
+      return r;
+    i = 4;  // ACC + STS + SIG
+  }
+  // (Other CI values for apator162 are not in the wild for AT-WMBUS-16-2;
+  //  we'd add them here if the user's meter ever shows up with a different
+  //  CI than 0x7A.)
+
+  if (i >= len)
+    return r;
+
+  // Skip any 2F idle filler.
   while (i < len && payload[i] == 0x2F)
     i++;
-  // Some telegrams put one or more leading status bytes before 0x0F; tolerate
-  // up to 8 bytes before bailing.
-  size_t scan_limit = (i + 8 < len) ? i + 8 : len;
-  while (i < scan_limit && payload[i] != 0x0F)
-    i++;
+
+  // The manufacturer-specific block must start with 0x0F per Apator's
+  // proprietary "162" framing.
   if (i >= len || payload[i] != 0x0F)
     return r;
   i++;  // consume 0x0F
 
-  // Per wmbusmeters: skip 8 bytes of date/faults that always follow 0x0F.
-  if (i + 8 > len)
+  // 4 bytes date + 3 bytes faults.
+  if (i + 7 > len)
     return r;
-  i += 8;
+  i += 7;
 
   while (i < len) {
     uint8_t reg = payload[i];
     if (reg == 0xFF)
-      break;  // padding / end
+      break;  // FF padding marks end of meaningful payload
     int sz = apator162_register_size(reg);
     if (sz < 0)
-      return r;  // unknown register — bail out instead of guessing
+      return r;  // unknown register — refuse to guess
     i++;
     if (i + (size_t)sz > len)
       return r;
