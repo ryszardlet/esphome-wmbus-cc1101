@@ -1,0 +1,14 @@
+.claude/
+.esphome/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.DS_Store
+test_*.local.yaml
+secrets.yaml

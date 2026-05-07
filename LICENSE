@@ -1,0 +1,14 @@
+MIT License
+
+Copyright (c) 2026 ryszardlet
+
+Portions of this code (CC1101 register settings, 3-of-6 decoder, apator162
+register table, wMBus block CRC) are derived from:
+  - wmbusmeters (https://github.com/wmbusmeters/wmbusmeters)
+    Copyright (C) 2017-2026 Fredrik Öhrström — GPL-3.0-or-later
+  - SzczepanLeon/esphome-components (https://github.com/SzczepanLeon/esphome-components)
+    Copyright (C) Szczepan Leon and contributors — GPL-3.0-or-later
+
+Because parts of this work derive from GPL-3.0 sources, this project as a
+whole is distributed under the terms of the GNU General Public License v3
+or later. See https://www.gnu.org/licenses/gpl-3.0.html for the full text.
