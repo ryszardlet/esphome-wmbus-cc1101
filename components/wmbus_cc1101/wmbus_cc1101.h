@@ -3,6 +3,10 @@
 #include "esphome/core/component.h"
 #include "esphome/components/sensor/sensor.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -46,6 +50,14 @@ class WMBusSensor : public Component {
   sensor::Sensor *rssi_{nullptr};
 };
 
+// Heap-allocated, ownership transferred via the FreeRTOS queue from the RX
+// task to the main loop. The vector holds the raw 3-of-6 encoded payload as
+// read from the FIFO; decoding happens on the main thread.
+struct RxPacket {
+  std::vector<uint8_t> raw;
+  int8_t rssi_dbm{0};
+};
+
 class WMBusComponent : public Component {
  public:
   void setup() override;
@@ -59,10 +71,15 @@ class WMBusComponent : public Component {
 
   void register_meter(WMBusSensor *m) { meters_.push_back(m); }
 
+  // Trampolines for FreeRTOS (need plain function pointers).
+  static void rx_task_trampoline(void *arg);
+
  protected:
-  // Called from main loop when CC1101 raised the FIFO threshold or sync IRQ.
-  void process_rx_();
-  // Decode a complete on-air block into an L|C|M|A|... raw frame.
+  void rx_task_loop_();
+  // Drains a single complete on-air frame from the FIFO into `out`. Returns
+  // false on overflow / timeout / decode error. Runs in the RX task.
+  bool drain_one_frame_(std::vector<uint8_t> &out, int8_t &rssi_out);
+
   bool decode_t1_payload_(const std::vector<uint8_t> &raw_radio,
                           std::vector<uint8_t> &decoded_frame);
   void dispatch_decoded_(const std::vector<uint8_t> &frame, int8_t rssi_dbm);
@@ -74,17 +91,10 @@ class WMBusComponent : public Component {
 
   std::vector<WMBusSensor *> meters_;
 
-  // Reception state machine
-  void receive_frame_inline_();
-  void reset_rx_();
-  bool determine_length_if_needed_();
-
-  std::vector<uint8_t> rx_buffer_;
-  size_t expected_size_{0};
-  uint8_t l_field_{0};
-  bool have_length_{false};
-  uint32_t rx_started_ms_{0};
-  int8_t rx_rssi_{0};
+  // FreeRTOS handles. Static so the IRAM_ATTR ISRs can reach them without
+  // dereferencing `this` (one component instance per ESP).
+  TaskHandle_t rx_task_handle_{nullptr};
+  QueueHandle_t rx_queue_{nullptr};
 };
 
 }  // namespace wmbus_cc1101
