@@ -159,15 +159,25 @@ void CC1101Driver::flush_rx_and_listen() {
 void CC1101Driver::configure_for_wmbus_t1() {
   // Settings for wM-Bus T1, 100 kbps 2-FSK, 868.95 MHz, 50 kHz deviation.
   // Values cross-checked with TI Design Note DN022 and SzczepanLeon's driver.
-  write_reg(0x00, 0x46);  // IOCFG2  - GDO2: serial data output
-  write_reg(0x01, 0x2E);  // IOCFG1  - High impedance (default)
-  write_reg(0x02, 0x00);  // IOCFG0  - GDO0: RX FIFO threshold (active high)
-  write_reg(0x03, 0x07);  // FIFOTHR - RX FIFO threshold = 32 bytes
-  write_reg(0x04, 0x54);  // SYNC1   - wM-Bus sync word high byte
-  write_reg(0x05, 0x3D);  // SYNC0   - wM-Bus sync word low byte
-  write_reg(0x06, 0xFF);  // PKTLEN  - max length (variable handled in code)
+  // IOCFG2 = 0x06: asserts on sync-word, deasserts at end of packet.
+  //   GDO2 HIGH for the whole reception window → FALLING edge = packet end.
+  write_reg(0x00, 0x06);  // IOCFG2  - sync-word indicator
+  write_reg(0x01, 0x2E);  // IOCFG1  - high impedance (default)
+  // IOCFG0 = 0x00: asserts when RX FIFO ≥ FIFOTHR threshold, deasserts when
+  //   below. Active high → RISING edge = "drain me now".
+  write_reg(0x02, 0x00);  // IOCFG0  - RX FIFO threshold
+  // FIFOTHR = 0x07: ADC retention off, close-in RX 0dB, RX threshold 32 bytes.
+  //   With 64-byte FIFO and 100 kbps T1, threshold→overflow window is ~5ms,
+  //   so the IRQ has to be drained promptly.
+  write_reg(0x03, 0x07);  // FIFOTHR
+  write_reg(0x04, 0x54);  // SYNC1   - wM-Bus T1 sync high byte
+  write_reg(0x05, 0x3D);  // SYNC0   - wM-Bus T1 sync low byte
+  write_reg(0x06, 0xFF);  // PKTLEN  - unused in infinite-length mode
   write_reg(0x07, 0x00);  // PKTCTRL1 - no addr check, no append status
-  write_reg(0x08, 0x00);  // PKTCTRL0 - fixed packet length, no whitening, no CRC
+  // PKTCTRL0 = 0x02: infinite packet length, no whitening, no CRC.
+  //   Chip stays in RX after sync; we strobe SIDLE+SFRX once a complete
+  //   wMBus frame has been read out.
+  write_reg(0x08, 0x02);  // PKTCTRL0
   write_reg(0x09, 0x00);  // ADDR
   write_reg(0x0A, 0x00);  // CHANNR
   write_reg(0x0B, 0x08);  // FSCTRL1 - IF freq ~152 kHz

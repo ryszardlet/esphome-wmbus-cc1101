@@ -75,6 +75,10 @@ class WMBusComponent : public Component {
   std::vector<WMBusSensor *> meters_;
 
   // Reception state machine
+  void receive_frame_inline_();
+  void reset_rx_();
+  bool determine_length_if_needed_();
+
   std::vector<uint8_t> rx_buffer_;
   size_t expected_size_{0};
   uint8_t l_field_{0};

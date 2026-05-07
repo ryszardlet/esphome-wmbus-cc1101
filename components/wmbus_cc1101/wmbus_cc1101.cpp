@@ -27,6 +27,17 @@ void WMBusComponent::set_pins(int mosi, int miso, int clk, int cs, int gdo0,
   radio_.set_pins(mosi, miso, clk, cs, gdo0, gdo2);
 }
 
+// GDO0 fires on RX FIFO threshold (≥32 bytes) — set a flag so loop() drains.
+// GDO2 fires on sync-word state changes — FALLING edge = end of packet.
+// We keep the ISR trivial (only a flag store) so it's safe to mark IRAM_ATTR.
+namespace {
+volatile bool s_gdo0_flag = false;  // FIFO ≥ threshold
+volatile bool s_gdo2_falling = false;  // packet ended
+
+void IRAM_ATTR gdo0_isr_handler() { s_gdo0_flag = true; }
+void IRAM_ATTR gdo2_isr_handler() { s_gdo2_falling = true; }
+}  // namespace
+
 void WMBusComponent::setup() {
   ESP_LOGI(TAG, "Initializing CC1101 (freq=%.3f MHz)", frequency_hz_ / 1.0e6);
   radio_ok_ = radio_.begin();
@@ -37,6 +48,20 @@ void WMBusComponent::setup() {
   }
   radio_.configure_for_wmbus_t1();
   rx_buffer_.reserve(584);  // ample headroom for max T1 frame
+
+  // Wire GDO0/GDO2 to hardware interrupts. Without this the ESPHome main
+  // loop polls every ~16 ms which is far slower than the CC1101 64-byte
+  // FIFO fills at 100 kbps (~5 ms threshold→overflow window).
+  int gdo0 = radio_.gdo0_pin();
+  if (gdo0 >= 0) {
+    pinMode(gdo0, INPUT);
+    attachInterrupt(digitalPinToInterrupt(gdo0), gdo0_isr_handler, RISING);
+  }
+  int gdo2 = radio_.gdo2_pin();
+  if (gdo2 >= 0) {
+    pinMode(gdo2, INPUT);
+    attachInterrupt(digitalPinToInterrupt(gdo2), gdo2_isr_handler, FALLING);
+  }
 }
 
 void WMBusComponent::dump_config() {
@@ -59,103 +84,132 @@ void WMBusSensor::dump_config() {
 void WMBusComponent::loop() {
   if (!radio_ok_)
     return;
-  process_rx_();
+
+  // Quick gate: only spend time here when there's something to do. Either
+  // the GDO0 ISR has flagged "FIFO past threshold" or we're already mid-frame.
+  if (!s_gdo0_flag && !s_gdo2_falling && rx_buffer_.empty() &&
+      !radio_.is_rx_overflow()) {
+    // Cheap secondary check: maybe data trickled in below the 32-byte
+    // threshold (e.g. final tail bytes after we drained). Probe RXBYTES
+    // before exiting, but only this one SPI read.
+    if (radio_.rx_bytes_available() == 0)
+      return;
+  }
+  s_gdo0_flag = false;
+  s_gdo2_falling = false;
+
+  receive_frame_inline_();
 }
 
-void WMBusComponent::process_rx_() {
-  // Bail out fast if there's nothing in the FIFO.
-  if (radio_.is_rx_overflow()) {
-    ESP_LOGW(TAG, "RX FIFO overflow, restarting RX");
-    rx_buffer_.clear();
-    have_length_ = false;
-    expected_size_ = 0;
-    radio_.flush_rx_and_listen();
-    return;
-  }
+void WMBusComponent::reset_rx_() {
+  rx_buffer_.clear();
+  have_length_ = false;
+  expected_size_ = 0;
+  s_gdo0_flag = false;
+  s_gdo2_falling = false;
+  radio_.flush_rx_and_listen();
+}
 
-  uint8_t avail = radio_.rx_bytes_available();
-  if (avail == 0) {
-    // No data right now. If we were in the middle of a frame, time it out.
-    if (!rx_buffer_.empty() && (millis() - rx_started_ms_) > 200) {
-      ESP_LOGV(TAG, "RX timeout (got %u/%u bytes)",
+bool WMBusComponent::determine_length_if_needed_() {
+  if (have_length_)
+    return true;
+  if (rx_buffer_.size() < 2)
+    return true;  // not yet — wait for more bytes
+  std::vector<uint8_t> first;
+  if (!decode_3of6(rx_buffer_.data(), 2, first) || first.empty()) {
+    ESP_LOGV(TAG, "Bad 3-of-6 in L field; restarting RX");
+    return false;
+  }
+  l_field_ = first[0];
+  size_t decoded_total = expected_decoded_size_from_l(l_field_);
+  expected_size_ = encoded_size_3of6(decoded_total);
+  have_length_ = true;
+  ESP_LOGV(TAG, "T1: L=%u, decoded=%u, encoded=%u",
+           (unsigned)l_field_, (unsigned)decoded_total,
+           (unsigned)expected_size_);
+  if (expected_size_ < 12 || expected_size_ > 580) {
+    ESP_LOGW(TAG, "Implausible expected size %u, dropping",
+             (unsigned)expected_size_);
+    return false;
+  }
+  return true;
+}
+
+// Drain a complete frame inline. Spins for up to 50 ms while bytes flow.
+// At 100 kbps a worst-case T1 frame (~290 encoded bytes) takes ~23 ms on
+// the air, so 50 ms covers the slow path (re-sync, partial reads) too.
+//
+// CC1101 RX-FIFO errata: a single-byte burst-read of the *last* byte while
+// in RX corrupts the read. So while we're still expecting more data we
+// always leave one byte in the FIFO; only the final chunk drains everything.
+void WMBusComponent::receive_frame_inline_() {
+  uint32_t deadline = millis() + 50;
+
+  while ((int32_t)(millis() - deadline) < 0) {
+    if (radio_.is_rx_overflow()) {
+      ESP_LOGW(TAG, "RX FIFO overflow at %u/%u bytes (frame discarded)",
                (unsigned)rx_buffer_.size(), (unsigned)expected_size_);
-      rx_buffer_.clear();
-      have_length_ = false;
-      expected_size_ = 0;
-      radio_.flush_rx_and_listen();
+      reset_rx_();
+      return;
     }
-    return;
-  }
 
-  // First read after sync: capture RSSI now (valid right after sync).
-  if (rx_buffer_.empty()) {
-    rx_started_ms_ = millis();
-    radio_.capture_rssi();
-    rx_rssi_ = radio_.rssi_dbm();
-  }
+    uint8_t avail = radio_.rx_bytes_available();
 
-  // CC1101 errata: when reading from FIFO during continuous RX, leave at
-  // least 1 byte to avoid the well-known FIFO read corruption. Drain all
-  // available bytes only when end-of-packet has been signalled.
-  // We don't know expected_size_ yet for the first byte — we need the L
-  // field decoded, which means we need 2 encoded bytes (16 bits → 10 bits
-  // of payload, enough for the first nibble of L). The simplest safe
-  // approach: keep at least 1 byte in the FIFO until we see expected_size_
-  // is met.
-  uint8_t to_read = avail;
-  bool drain_all = have_length_ && (rx_buffer_.size() + avail >= expected_size_);
-  if (!drain_all && to_read > 1)
-    to_read -= 1;
+    // First chunk: capture RSSI now (valid right after sync word).
+    if (rx_buffer_.empty() && avail > 0) {
+      rx_started_ms_ = millis();
+      radio_.capture_rssi();
+      rx_rssi_ = radio_.rssi_dbm();
+    }
 
-  size_t old = rx_buffer_.size();
-  rx_buffer_.resize(old + to_read);
-  radio_.read_burst(CC1101_FIFO, rx_buffer_.data() + old, to_read);
+    // Decide how many bytes to read this iteration.
+    size_t to_read = 0;
+    if (have_length_ && rx_buffer_.size() + avail >= expected_size_) {
+      // Final chunk — drain exactly what's left.
+      to_read = expected_size_ - rx_buffer_.size();
+    } else if (avail > 1) {
+      // Mid-frame — leave 1 byte in FIFO to avoid the errata.
+      to_read = static_cast<size_t>(avail) - 1;
+    }
 
-  // Try to determine expected size as soon as we have 2 bytes (enough to
-  // decode the first byte = L field).
-  if (!have_length_ && rx_buffer_.size() >= 2) {
-    std::vector<uint8_t> first;
-    if (decode_3of6(rx_buffer_.data(), 2, first) && !first.empty()) {
-      l_field_ = first[0];
-      size_t decoded_total = expected_decoded_size_from_l(l_field_);
-      expected_size_ = encoded_size_3of6(decoded_total);
-      have_length_ = true;
-      ESP_LOGV(TAG, "T1: L=%u, decoded=%u, encoded=%u",
-               (unsigned)l_field_, (unsigned)decoded_total,
-               (unsigned)expected_size_);
-      if (expected_size_ > 600) {
-        ESP_LOGW(TAG, "Implausible expected size %u, dropping",
-                 (unsigned)expected_size_);
-        rx_buffer_.clear();
-        have_length_ = false;
-        radio_.flush_rx_and_listen();
+    if (to_read > 0) {
+      size_t old = rx_buffer_.size();
+      rx_buffer_.resize(old + to_read);
+      radio_.read_burst(CC1101_FIFO, rx_buffer_.data() + old, to_read);
+
+      if (!determine_length_if_needed_()) {
+        reset_rx_();
+        return;
+      }
+
+      // Frame complete?
+      if (have_length_ && rx_buffer_.size() >= expected_size_) {
+        rx_buffer_.resize(expected_size_);  // trim any over-read
+        std::vector<uint8_t> decoded;
+        if (decode_t1_payload_(rx_buffer_, decoded)) {
+          dispatch_decoded_(decoded, rx_rssi_);
+        } else {
+          ESP_LOGD(TAG, "Frame failed decode/CRC (len=%u)",
+                   (unsigned)rx_buffer_.size());
+        }
+        reset_rx_();
         return;
       }
     } else {
-      // Bad L-field encoding — restart.
-      ESP_LOGV(TAG, "Bad 3-of-6 in L field; restarting RX");
-      rx_buffer_.clear();
-      have_length_ = false;
-      radio_.flush_rx_and_listen();
-      return;
+      // Nothing to drain right now. Either we haven't synced yet
+      // (rx_buffer_ empty) or we're waiting for the next 32-byte chunk.
+      if (rx_buffer_.empty() && !s_gdo0_flag && !s_gdo2_falling)
+        return;  // false alarm — let loop() come back later
+      if (s_gdo2_falling) {
+        s_gdo2_falling = false;  // packet ended; drain whatever remains
+      }
+      delayMicroseconds(200);
     }
   }
 
-  // Frame complete?
-  if (have_length_ && rx_buffer_.size() >= expected_size_) {
-    rx_buffer_.resize(expected_size_);  // trim any over-read
-    std::vector<uint8_t> decoded;
-    if (decode_t1_payload_(rx_buffer_, decoded)) {
-      dispatch_decoded_(decoded, rx_rssi_);
-    } else {
-      ESP_LOGD(TAG, "Frame failed decode/CRC (len=%u)",
-               (unsigned)rx_buffer_.size());
-    }
-    rx_buffer_.clear();
-    have_length_ = false;
-    expected_size_ = 0;
-    radio_.flush_rx_and_listen();
-  }
+  ESP_LOGV(TAG, "RX inline timeout (%u/%u bytes)",
+           (unsigned)rx_buffer_.size(), (unsigned)expected_size_);
+  reset_rx_();
 }
 
 bool WMBusComponent::decode_t1_payload_(const std::vector<uint8_t> &raw_radio,
