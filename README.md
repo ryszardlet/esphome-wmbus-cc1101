@@ -15,12 +15,14 @@ override built-in ESPHome components and has no dependency on
 | Radio               | TI **CC1101** over SPI                              |
 | Link mode           | wM-Bus **T1** at 868.950 MHz (3-of-6 encoded)       |
 | Driver              | Apator **AT-WMBUS-16-2** (`apator162`)              |
-| Encryption          | Mode 0 (unencrypted) — `key: "00…00"`               |
+| Encryption          | Mode 0 (unencrypted) **or** mode 5 (AES-128-CBC)    |
 | Multiple meters     | Yes — one `sensor:` entry per meter                 |
 
-Unencrypted apator162 meters are the original target. AES-128 (mode 5) is
-intentionally not implemented — the decoder will emit a warning if it sees a
-ciphertext frame it cannot read.
+If your meter sends AES-128-CBC (mode 5) frames — easy to spot in the log
+as `Meter 0x… is AES-128 encrypted (mode 5, N blocks). Configure 'key:'…`
+— set `key:` to the 32-hex-character meter key (typically obtained from
+the water utility or the meter label). Mode 7 / mode 13 are not
+implemented and the component will say so explicitly.
 
 ## Wiring (ESP32 ↔ CC1101)
 

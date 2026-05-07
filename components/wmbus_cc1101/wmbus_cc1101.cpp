@@ -7,6 +7,7 @@
 #include <Arduino.h>
 
 #include "apator162.h"
+#include "wmbus_aes.h"
 #include "wmbus_utils.h"
 
 namespace esphome {
@@ -306,7 +307,100 @@ void WMBusComponent::dispatch_decoded_(const std::vector<uint8_t> &frame,
 
   const uint8_t *payload = frame.data() + 11;
   size_t payload_len = frame.size() - 11;
-  match->on_telegram(ci, payload, payload_len, rssi_dbm);
+
+  // Parse the CI=0x7A short transport header so we can detect AES
+  // encryption (EN 13757-3 §7.2.2 / §9.2.4): the 2-byte Configuration
+  // Word holds the security mode in bits 12..8 and the number of
+  // encrypted 16-byte blocks in bits 7..4. Mode 5 = AES-128-CBC with IV.
+  if (ci != 0x7A) {
+    // Other CIs (e.g. 0x72 long header) aren't seen on apator162 in the
+    // wild — pass through and let the meter decoder handle / reject it.
+    match->on_telegram(ci, payload, payload_len, rssi_dbm);
+    return;
+  }
+  if (payload_len < 4) {
+    ESP_LOGW(TAG, "CI=0x7A frame too short for short header (%u bytes)",
+             (unsigned)payload_len);
+    return;
+  }
+
+  uint8_t acc = payload[0];
+  uint8_t sts = payload[1];
+  uint16_t cw = static_cast<uint16_t>(payload[2]) |
+                (static_cast<uint16_t>(payload[3]) << 8);
+  int encr_mode = (cw & 0x1F00) ? ((cw >> 8) & 0x1F) : 0;
+  int encr_blocks = (cw >> 4) & 0x0F;
+  (void) sts;
+
+  if (encr_mode == 0) {
+    // Cleartext — straight to the decoder.
+    match->on_telegram(ci, payload, payload_len, rssi_dbm);
+    return;
+  }
+
+  if (encr_mode != 5) {
+    ESP_LOGW(TAG,
+             "Meter 0x%08X frame uses unsupported wMBus encryption mode %d "
+             "(only mode 5 / AES-128-CBC with IV is implemented).",
+             a, encr_mode);
+    return;
+  }
+
+  uint8_t key[16];
+  const std::string &key_hex = match->key_hex();
+  if (key_hex.empty() || !hex_to_aes_key(key_hex, key)) {
+    ESP_LOGW(TAG,
+             "Meter 0x%08X is AES-128 encrypted (mode 5, %d blocks). "
+             "Configure 'key:' with the 32-hex-char meter key.",
+             a, encr_blocks);
+    return;
+  }
+
+  size_t enc_offset = 4;  // skip ACC + STS + CW
+  size_t enc_len = static_cast<size_t>(encr_blocks) * 16;
+  if (payload_len < enc_offset + enc_len) {
+    ESP_LOGW(TAG,
+             "Meter 0x%08X: encrypted region (%u bytes from %u) does not "
+             "fit payload (%u bytes total).",
+             a, (unsigned)enc_len, (unsigned)enc_offset, (unsigned)payload_len);
+    return;
+  }
+
+  uint8_t iv[16];
+  build_mode5_iv(m, a, ver, type, acc, iv);
+
+  std::vector<uint8_t> plain(enc_len);
+  if (!aes_cbc_decrypt(payload + enc_offset, enc_len, key, iv, plain.data())) {
+    ESP_LOGW(TAG, "Meter 0x%08X: AES-CBC decryption failed", a);
+    return;
+  }
+
+  // Sanity check: per Apator framing the plaintext begins with 0x2F2F
+  // filler. If decryption produced anything else, the key is wrong.
+  if (plain.size() < 2 || plain[0] != 0x2F || plain[1] != 0x2F) {
+    ESP_LOGW(TAG,
+             "Meter 0x%08X: AES decrypted but plaintext doesn't start with "
+             "2F2F (got %02X %02X). Wrong key?",
+             a, plain.size() ? plain[0] : 0, plain.size() > 1 ? plain[1] : 0);
+    return;
+  }
+
+  // Stitch the cleartext payload: keep the 4-byte short-header prefix,
+  // replace the encrypted region with plaintext, keep any tail bytes.
+  std::vector<uint8_t> dec_payload;
+  dec_payload.reserve(payload_len);
+  dec_payload.insert(dec_payload.end(), payload, payload + enc_offset);
+  dec_payload.insert(dec_payload.end(), plain.begin(), plain.end());
+  if (payload_len > enc_offset + enc_len) {
+    dec_payload.insert(dec_payload.end(),
+                       payload + enc_offset + enc_len,
+                       payload + payload_len);
+  }
+
+  ESP_LOGV(TAG, "AES-CBC decrypted (%u blocks): %s", encr_blocks,
+           format_hex_pretty(plain).c_str());
+
+  match->on_telegram(ci, dec_payload.data(), dec_payload.size(), rssi_dbm);
 }
 
 void WMBusSensor::on_telegram(uint8_t ci, const uint8_t *payload,
